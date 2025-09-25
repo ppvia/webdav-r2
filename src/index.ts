@@ -76,8 +76,11 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 }
 
 function make_resource_path(request: Request): string {
-	let path = new URL(request.url).pathname.slice(1);
-	path = path.endsWith('/') ? path.slice(0, -1) : path;
+	let path = new URL(request.url).pathname;
+	// 移除开头的斜杠
+	path = path.startsWith('/') ? path.slice(1) : path;
+	// 移除结尾的斜杠（除非是根目录）
+	path = path.endsWith('/') && path !== '/' ? path.slice(0, -1) : path;
 	return path;
 }
 
@@ -331,7 +334,8 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 <multistatus xmlns="DAV:">`;
 
 	if (resource_path === '') {
-		page += generate_propfind_response(null);
+		// 修复：为根目录返回正确的响应
+		page += generate_root_response();
 		is_collection = true;
 	} else {
 		let object = await bucket.head(resource_path);
@@ -346,19 +350,23 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 		let depth = request.headers.get('Depth') ?? 'infinity';
 		switch (depth) {
 			case '0':
+				// 对于根目录的depth=0，不需要列出子项
 				break;
 			case '1':
 				{
-					let prefix = resource_path === '' ? resource_path : resource_path + '/';
+					let prefix = resource_path === '' ? '' : resource_path + '/';
 					for await (let object of listAll(bucket, prefix)) {
+						// 修复：避免重复列出根目录本身
+						if (resource_path === '' && object.key === '') continue;
 						page += generate_propfind_response(object);
 					}
 				}
 				break;
 			case 'infinity':
 				{
-					let prefix = resource_path === '' ? resource_path : resource_path + '/';
+					let prefix = resource_path === '' ? '' : resource_path + '/';
 					for await (let object of listAll(bucket, prefix, true)) {
+						if (resource_path === '' && object.key === '') continue;
 						page += generate_propfind_response(object);
 					}
 				}
@@ -373,10 +381,28 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 	return new Response(page, {
 		status: 207,
 		headers: {
-			'Content-Type': 'text/xml',
+			'Content-Type': 'text/xml; charset=utf-8',
 		},
 	});
 }
+
+// 新增：专门为根目录生成响应的函数
+function generate_root_response(): string {
+	return `
+	<response>
+		<href>/</href>
+		<propstat>
+			<prop>
+				<creationdate>${new Date().toUTCString()}</creationdate>
+				<getlastmodified>${new Date().toUTCString()}</getlastmodified>
+				<resourcetype><collection /></resourcetype>
+				<displayname>Root</displayname>
+			</prop>
+			<status>HTTP/1.1 200 OK</status>
+		</propstat>
+	</response>`;
+}
+
 
 async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Response> {
 	const resource_path = make_resource_path(request);
@@ -702,14 +728,16 @@ const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'GET', 'HE
 async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Response> {
 	switch (request.method) {
 		case 'OPTIONS': {
-			return new Response(null, {
-				status: 204,
-				headers: {
-					Allow: SUPPORT_METHODS.join(', '),
-					DAV: DAV_CLASS,
-				},
-			});
-		}
+	return new Response(null, {
+		status: 200, // 改为200而不是204
+		headers: {
+			Allow: SUPPORT_METHODS.join(', '),
+			DAV: DAV_CLASS,
+			'MS-Author-Via': 'DAV',
+			'Accept-Ranges': 'bytes',
+		},
+	});
+}
 		case 'HEAD': {
 			return await handle_head(request, bucket);
 		}
@@ -762,21 +790,39 @@ export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const { bucket } = env;
 
-		if (
-			request.method !== 'OPTIONS' &&
-			!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)
-		) {
+		// 对于OPTIONS请求，允许无认证访问（用于CORS预检）
+		if (request.method === 'OPTIONS') {
+			return new Response(null, {
+				status: 200,
+				headers: {
+					Allow: SUPPORT_METHODS.join(', '),
+					DAV: DAV_CLASS,
+					'MS-Author-Via': 'DAV',
+					'Access-Control-Allow-Origin': request.headers.get('Origin') ?? '*',
+					'Access-Control-Allow-Methods': SUPPORT_METHODS.join(', '),
+					'Access-Control-Allow-Headers': ['authorization', 'content-type', 'depth', 'overwrite', 'destination', 'range'].join(', '),
+					'Access-Control-Allow-Credentials': 'true',
+					'Access-Control-Max-Age': '86400',
+				},
+			});
+		}
+
+		// 检查认证
+		const authHeader = request.headers.get('Authorization') ?? '';
+		if (!is_authorized(authHeader, env.USERNAME, env.PASSWORD)) {
 			return new Response('Unauthorized', {
 				status: 401,
 				headers: {
-					'WWW-Authenticate': 'Basic realm="webdav"',
+					'WWW-Authenticate': 'Basic realm="WebDAV Server"',
+					'Access-Control-Allow-Origin': request.headers.get('Origin') ?? '*',
+					'Access-Control-Allow-Credentials': 'true',
 				},
 			});
 		}
 
 		let response: Response = await dispatch_handler(request, bucket);
 
-		// Set CORS headers
+		// 设置CORS头
 		response.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') ?? '*');
 		response.headers.set('Access-Control-Allow-Methods', SUPPORT_METHODS.join(', '));
 		response.headers.set(
@@ -785,11 +831,9 @@ export default {
 		);
 		response.headers.set(
 			'Access-Control-Expose-Headers',
-			['content-type', 'content-length', 'dav', 'etag', 'last-modified', 'location', 'date', 'content-range'].join(
-				', ',
-			),
+			['content-type', 'content-length', 'dav', 'etag', 'last-modified', 'location', 'date', 'content-range'].join(', '),
 		);
-		response.headers.set('Access-Control-Allow-Credentials', 'false');
+		response.headers.set('Access-Control-Allow-Credentials', 'true');
 		response.headers.set('Access-Control-Max-Age', '86400');
 
 		return response;
